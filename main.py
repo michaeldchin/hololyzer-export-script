@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 
+from field_mappings import LABEL_MAP
+
 HOLODEX_API_KEY = os.getenv("HOLODEX_API_KEY")
 if not HOLODEX_API_KEY:
     raise ValueError("HOLODEX_API_KEY not found in environment variables")
@@ -224,42 +226,22 @@ def get_video_data(holodex_info):
         else:
             return ''
 
-        for line in lines:
-            if line.startswith('公開日時'): data['public_time'] = extract_field('date', line)
-            if line.startswith('開始日時'): data['start_time'] = extract_field('date', line)
-            if line.startswith('終了日時'): data['end_time'] = extract_field('date', line)
+    for line in lines:
+        # Special: membership gift range (メンシギフト)
+        if line.startswith('\u30e1\u30f3\u30b7\u30ae\u30d5\u30c8') and '-' not in line:
+            match = re.search(r"(\d+)\D+(\d+)", line)
+            if match:
+                data['member_gift_num_from'] = int(match.group(1))
+                data['member_gift_num_to'] = int(match.group(2))
+            continue
 
-            if line.startswith('動画時間'): data['total_time'] = extract_field('string', line)
+        # General label → field mapping from field_mappings.py
+        for label, (field_name, field_type) in LABEL_MAP.items():
+            if line.startswith(label):
+                data[field_name] = extract_field(field_type, line)
+                break
 
-            if line.startswith('総チャット数'): data['chat_num_total'] = extract_field('int', line)
-            if line.startswith('チャット数（日本語）'): data['chat_num_ja'] = extract_field('int', line)
-            if line.startswith('チャット数（スタンプ）'): data['chat_num_emoji'] = extract_field('int', line)
-            if line.startswith('チャット数（英語）'): data['chat_num_en'] = extract_field('int', line)
-
-            if line.startswith('ユニークユーザー数'): data['uniq_user_num'] = extract_field('int', line)
-            if line.startswith('ユニークメンバー数'): data['uniq_member_num'] = extract_field('int', line)
-
-            if line.startswith('総スパチャ金額'): data['total_super_chat_amount_yen'] = extract_field('int', line)
-
-            if line.startswith('英語コメ率'): data['english_chat_ratio'] = extract_field('percent', line)
-            if line.startswith('メンバーコメ率'): data['member_chat_ratio'] = extract_field('percent', line)
-
-            if line.startswith('平均毎秒コメ数'): data['chat_per_second'] = extract_field('float', line)
-
-            if line.startswith('最大同接'): data['max_ccv'] = extract_field('int', line)
-
-            if line.startswith('メンシ入り'): data['member_num'] = extract_field('int', line)
-
-            if line.startswith('メンシギフト') and '-' not in line:
-                match = re.search(r"(\d+)\D+(\d+)", line)
-
-                if match:
-                    data['member_gift_num_from'] = int(match.group(1))
-                    data['member_gift_num_to'] = int(match.group(2))
-
-            if line.startswith('マイルストーン'): data['milestone_num'] = extract_field('int', line)
-
-        return data
+    return data
 
 
 def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
