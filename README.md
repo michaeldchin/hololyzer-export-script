@@ -1,4 +1,4 @@
-# Setup
+-# Setup
 
 **Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
@@ -21,4 +21,8 @@
 3. **Run the script:**
    ```bash
    uv run --env-file=.env main.py
+   ```
+
+   ```bash
+   uv run --env-file=.env main.py --latest-only
    ```

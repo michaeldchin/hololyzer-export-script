@@ -2,6 +2,7 @@ import csv
 import os
 import requests
 import re
+import sys
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 
@@ -301,8 +302,11 @@ def load_existing_ids(output_file):
     return existing_ids, counts_by_channel
 
 
-def process_output_file(output_file, fieldnames):
-    """Create or append to CSV, streaming video rows and skipping existing ids."""
+def process_output_file(output_file, fieldnames, limit_recent_only=False):
+    """Create or append to CSV, streaming video rows and skipping existing ids.
+    
+    If limit_recent_only is True, only fetch the latest 50 entries for each channel.
+    """
     existing_ids, counts_by_channel = load_existing_ids(output_file)
 
     # iterate channels and decide whether to skip based on Holodex 'total'
@@ -338,13 +342,16 @@ def process_output_file(output_file, fieldnames):
             existing_count = counts_by_channel.get(channel['id'], 0)
             total = holodex_total_for_channel(channel)
 
+            # If limit_recent_only flag is set, always fetch only the latest 50
+            if limit_recent_only:
+                channel['last_n'] = 50
+                print(f"Fetching latest 50 entries for channel {channel['en_name']} ({channel['id']})")
             # If Holodex reported total and it's less/equal to our existing rows, skip
-            if total is not None and existing_count >= total:
+            elif total is not None and existing_count >= total:
                 print(f"Skipping channel {channel['en_name']} ({channel['id']}) — existing rows ({existing_count}) >= Holodex total ({total})")
                 continue
-
             # If channel already has rows and is within 50 of Holodex total, only fetch latest 50
-            if total is not None and existing_count > 0 and (total - existing_count) <= 50:
+            elif total is not None and existing_count > 0 and (total - existing_count) <= 50:
                 channel['last_n'] = 50
                 print(f"Partial update for channel {channel['en_name']} ({channel['id']}): fetching latest 50 (missing {total - existing_count})")
             else:
@@ -355,8 +362,11 @@ def process_output_file(output_file, fieldnames):
 
 def main():
     output_file = "output/dataset.csv"
+    
+    # Check for --latest-only flag to limit to most recent 50 entries per channel
+    limit_recent_only = "--latest-only" in sys.argv
 
-    process_output_file(output_file, FIELDS)
+    process_output_file(output_file, FIELDS, limit_recent_only)
 
     print(f"Wrote CSV to {output_file}")
 
