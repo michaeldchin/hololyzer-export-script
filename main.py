@@ -3,6 +3,8 @@ import os
 import requests
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 
@@ -46,18 +48,21 @@ FIELDS = [
     'channel_ja_category',
 ]
 
-response_string_en = requests.get(hololyzer_url + "/youtube/locales/string_en.json")
+# Shared session for connection pooling across all requests
+session = requests.Session()
+
+response_string_en = session.get(hololyzer_url + "/youtube/locales/string_en.json")
 response_string_en.raise_for_status()
 response_string_en.encoding = "utf-8"
 string_en = response_string_en.json()
 
-response_string_ja = requests.get(hololyzer_url + "/youtube/locales/string_ja.json")
+response_string_ja = session.get(hololyzer_url + "/youtube/locales/string_ja.json")
 response_string_ja.raise_for_status()
 response_string_ja.encoding = "utf-8"
 string_ja = response_string_ja.json()
 
 def channels():
-    response = requests.get(hololyzer_url)
+    response = session.get(hololyzer_url)
     response.raise_for_status()
     response.encoding = "utf-8"
 
@@ -101,98 +106,137 @@ def get_video_data(holodex_info):
     data['holodex_published_at'] = holodex_info.get('published_at', '')
     data['holodex_available_at'] = holodex_info.get('available_at', '')
 
-    try:
-        response = requests.get(f"{hololyzer_url}/youtube/video/{holodex_info['id']}.html")
-        response.raise_for_status()
+    video_id = holodex_info['id']
+    url = f"{hololyzer_url}/youtube/video/{video_id}.html"
 
-    except requests.exceptions.HTTPError as error:
-        if error.response is not None and error.response.status_code != 404: raise
+    max_attempts = 4
+    # exponential backoff: 1s, 3s, 6s = ~10s total wait
+    backoffs = [1, 3, 6]
+    response = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.get(url, timeout=10)
+            response.raise_for_status()
+            break  # success
+        except requests.exceptions.Timeout:
+            if attempt < max_attempts:
+                wait = backoffs[attempt - 1]
+                print(f"  [retry {attempt}/{max_attempts - 1}] Timeout for {video_id}, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  [give up] Timeout for {video_id} after {max_attempts} attempts")
+                return data
+        except requests.exceptions.HTTPError as error:
+            if error.response is not None and error.response.status_code == 404:
+                return data
+            if attempt < max_attempts:
+                wait = backoffs[attempt - 1]
+                status = error.response.status_code if error.response else '?'
+                print(f"  [retry {attempt}/{max_attempts - 1}] HTTP {status} for {video_id}, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  [give up] HTTP error for {video_id} after {max_attempts} attempts: {error}")
+                return data
+        except requests.exceptions.ConnectionError as error:
+            if attempt < max_attempts:
+                wait = backoffs[attempt - 1]
+                print(f"  [retry {attempt}/{max_attempts - 1}] Connection error for {video_id}, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  [give up] Connection error for {video_id} after {max_attempts} attempts: {error}")
+                return data
+
+    # request succeeded — parse the page
+    response.encoding = "utf-8"
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    table = soup.select_one('table[height]')
+
+    if not table:
         return data
-    else:
-        response.encoding = "utf-8"
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+    table_text = table.get_text()
 
-        table = soup.select_one('table[height]')
+    table_text = table_text.replace("\r\n", "\n").strip("\n")
+    lines = [line.replace('　', '').strip() for line in table_text.split('\n') if '：' in line]
 
-        if not table: raise
+    def extract_field(field_type, line):
+        if '-' not in line:
+            field = line.split('：')[1]
 
-        table_text = table.get_text()
+            if field_type == 'date':
+                string_no_timezone = field.replace("(JST)", "")
 
-        table_text = table_text.replace("\r\n", "\n").strip("\n")
-        lines = [line.replace('　', '').strip() for line in table_text.split('\n') if '：' in line]
+                if not string_no_timezone: return ''
 
-        def extract_field(field_type, line):
-            if '-' not in line:
-                field = line.split('：')[1]
+                dt_naive = datetime.strptime(string_no_timezone.strip(), "%Y/%m/%d %H:%M:%S")
 
-                if field_type == 'date':
-                    string_no_timezone = field.replace("(JST)", "")
+                jst = timezone(timedelta(hours=9))
+                dt_jst = dt_naive.replace(tzinfo=jst)
 
-                    if not string_no_timezone: return ''
+                return dt_jst.isoformat()
+            elif field_type == 'string':
+                return field if field else ''
+            elif field_type == 'int':
+                match = re.search(r"\d+", field.replace(',', ''))
+                return int(match.group()) if match else ''
+            elif field_type == 'percent':
+                match = re.search(r"[\d\.]+", field.replace(',', ''))
+                return float(match.group()) / 100 if match else ''
+            elif field_type == 'float':
+                match = re.search(r"[\d\.]+", field.replace(',', ''))
+                return float(match.group()) if match else ''
+        else:
+            return ''
 
-                    dt_naive = datetime.strptime(string_no_timezone.strip(), "%Y/%m/%d %H:%M:%S")
+    for line in lines:
+        if line.startswith('公開日時'): data['public_time'] = extract_field('date', line)
+        if line.startswith('開始日時'): data['start_time'] = extract_field('date', line)
+        if line.startswith('終了日時'): data['end_time'] = extract_field('date', line)
 
-                    jst = timezone(timedelta(hours=9))
-                    dt_jst = dt_naive.replace(tzinfo=jst)
+        if line.startswith('動画時間'): data['total_time'] = extract_field('string', line)
 
-                    return dt_jst.isoformat()
-                elif field_type == 'string':
-                    return field if field else ''
-                elif field_type == 'int':
-                    match = re.search(r"\d+", field.replace(',', ''))
-                    return int(match.group()) if match else ''
-                elif field_type == 'percent':
-                    match = re.search(r"[\d\.]+", field.replace(',', ''))
-                    return float(match.group()) / 100 if match else ''
-                elif field_type == 'float':
-                    match = re.search(r"[\d\.]+", field.replace(',', ''))
-                    return float(match.group()) if match else ''
-            else: return ''
+        if line.startswith('総チャット数'): data['chat_num_total'] = extract_field('int', line)
+        if line.startswith('チャット数（日本語）'): data['chat_num_ja'] = extract_field('int', line)
+        if line.startswith('チャット数（スタンプ）'): data['chat_num_emoji'] = extract_field('int', line)
+        if line.startswith('チャット数（英語）'): data['chat_num_en'] = extract_field('int', line)
 
-        for line in lines:
-            if line.startswith('公開日時'): data['public_time'] = extract_field('date', line)
-            if line.startswith('開始日時'): data['start_time'] = extract_field('date', line)
-            if line.startswith('終了日時'): data['end_time'] = extract_field('date', line)
+        if line.startswith('ユニークユーザー数'): data['uniq_user_num'] = extract_field('int', line)
+        if line.startswith('ユニークメンバー数'): data['uniq_member_num'] = extract_field('int', line)
 
-            if line.startswith('動画時間'): data['total_time'] = extract_field('string', line)
+        if line.startswith('総スパチャ金額'): data['total_super_chat_amount_yen'] = extract_field('int', line)
 
-            if line.startswith('総チャット数'): data['chat_num_total'] = extract_field('int', line)
-            if line.startswith('チャット数（日本語）'): data['chat_num_ja'] = extract_field('int', line)
-            if line.startswith('チャット数（スタンプ）'): data['chat_num_emoji'] = extract_field('int', line)
-            if line.startswith('チャット数（英語）'): data['chat_num_en'] = extract_field('int', line)
+        if line.startswith('英語コメ率'): data['english_chat_ratio'] = extract_field('percent', line)
+        if line.startswith('メンバーコメ率'): data['member_chat_ratio'] = extract_field('percent', line)
 
-            if line.startswith('ユニークユーザー数'): data['uniq_user_num'] = extract_field('int', line)
-            if line.startswith('ユニークメンバー数'): data['uniq_member_num'] = extract_field('int', line)
+        if line.startswith('平均毎秒コメ数'): data['chat_per_second'] = extract_field('float', line)
 
-            if line.startswith('総スパチャ金額'): data['total_super_chat_amount_yen'] = extract_field('int', line)
+        if line.startswith('最大同接'): data['max_ccv'] = extract_field('int', line)
 
-            if line.startswith('英語コメ率'): data['english_chat_ratio'] = extract_field('percent', line)
-            if line.startswith('メンバーコメ率'): data['member_chat_ratio'] = extract_field('percent', line)
+        if line.startswith('メンシ入り'): data['member_num'] = extract_field('int', line)
 
-            if line.startswith('平均毎秒コメ数'): data['chat_per_second'] = extract_field('float', line)
+        if line.startswith('メンシギフト') and '-' not in line:
+            match = re.search(r"(\d+)\D+(\d+)", line)
 
-            if line.startswith('最大同接'): data['max_ccv'] = extract_field('int', line)
+            if match:
+                data['member_gift_num_from'] = int(match.group(1))
+                data['member_gift_num_to'] = int(match.group(2))
 
-            if line.startswith('メンシ入り'): data['member_num'] = extract_field('int', line)
+        if line.startswith('マイルストーン'): data['milestone_num'] = extract_field('int', line)
 
-            if line.startswith('メンシギフト') and '-' not in line:
-                match = re.search(r"(\d+)\D+(\d+)", line)
-
-                if match:
-                    data['member_gift_num_from'] = int(match.group(1))
-                    data['member_gift_num_to'] = int(match.group(2))
-
-            if line.startswith('マイルストーン'): data['milestone_num'] = extract_field('int', line)
-
-        return data
+    return data
 
 
 def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
-    """Fetch video ids for channel, stream each video's data into csv_writer.
+    """Fetch video ids for channel, scrape hololyzer data in parallel, write to csv_writer.
 
     csv_writer is expected to be a csv.DictWriter already configured with fieldnames.
     """
+    # --- Configurable parallelism & rate limiting ---
+    MAX_WORKERS = 8          # concurrent requests to hololyzer
+    BATCH_DELAY = 0.3        # seconds between batches (backpressure)
+
     videos_result = []
 
     print(f"Fetching video info from Holodex for channel", channel['en_name'], channel['id'])
@@ -203,7 +247,7 @@ def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
     if last_n is not None:
         params = {"type": "stream", "limit": last_n, "offset": 0}
         headers = { "X-APIKEY": HOLODEX_API_KEY }
-        response = requests.get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params, headers=headers)
+        response = session.get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params, headers=headers)
         response.raise_for_status()
         response.encoding = "utf-8"
         holodex_video_info_response = response.json()
@@ -226,7 +270,7 @@ def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
 
             headers = { "X-APIKEY": HOLODEX_API_KEY }
 
-            response = requests.get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params, headers=headers)
+            response = session.get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params, headers=headers)
             response.raise_for_status()
             response.encoding = "utf-8"
 
@@ -248,29 +292,57 @@ def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
 
     existing_ids = existing_ids or set()
 
+    # Filter out already-existing videos
+    new_videos = [v for v in videos_result if v['id'] not in existing_ids]
+    skipped = len(videos_result) - len(new_videos)
+    if skipped:
+        print(f"Skipping {skipped} already-present videos for channel {channel['en_name']}")
+
     total = len(videos_result)
-    for idx, holodex_info in enumerate(videos_result, start=1):
-        if holodex_info['id'] in existing_ids:
-            # already present in CSV, skip
-            print(f"[{idx}/{total}] Channel: {channel['en_name']} ({channel['id']}) - Video: {holodex_info['id']} - Skipped (already present)")
-            continue
-        # fetch and build complete data
-        complete_data = {
-            **get_video_data(holodex_info),
-            'channel_id': channel['id'],
-            'channel_en_name': channel['en_name'],
-            'channel_ja_name': channel['ja_name'],
-            'channel_en_category': channel['en_category'],
-            'channel_ja_category': channel['ja_category'],
-        }
+    processed = skipped  # for progress counter
 
-        # prepare a flat mapping for CSV writer following fieldnames order
-        row = { name: complete_data.get(name) for name in fieldnames }
+    # --- Process new videos in parallel batches ---
+    for batch_start in range(0, len(new_videos), MAX_WORKERS):
+        batch = new_videos[batch_start:batch_start + MAX_WORKERS]
+        batch_num = batch_start // MAX_WORKERS + 1
+        total_batches = (len(new_videos) + MAX_WORKERS - 1) // MAX_WORKERS
 
-        # print channel and id to show progress with counter
-        print(f"[{idx}/{total}] Channel: {channel['en_name']} ({channel['id']}) - Video: {holodex_info['id']} - Wrote to CSV")
+        # Kick off parallel hololyzer scrapes for this batch
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_video = {
+                executor.submit(get_video_data, v): v
+                for v in batch
+            }
 
-        csv_writer.writerow(row)
+            for future in as_completed(future_to_video):
+                holodex_info = future_to_video[future]
+                processed += 1
+
+                try:
+                    scraped_data = future.result()
+                except Exception:
+                    # If scraping fails, still write a row with holodex metadata only
+                    scraped_data = {k: '' for k in FIELDS}
+                    scraped_data['video_id'] = holodex_info.get('id', '')
+                    scraped_data['video_title'] = holodex_info.get('title', '')
+
+                complete_data = {
+                    **scraped_data,
+                    'channel_id': channel['id'],
+                    'channel_en_name': channel['en_name'],
+                    'channel_ja_name': channel['ja_name'],
+                    'channel_en_category': channel['en_category'],
+                    'channel_ja_category': channel['ja_category'],
+                }
+
+                row = {name: complete_data.get(name) for name in fieldnames}
+                csv_writer.writerow(row)
+
+                print(f"[{processed}/{total}] Channel: {channel['en_name']} ({channel['id']}) - Video: {holodex_info['id']} - Wrote to CSV")
+
+        # Small delay between batches to avoid hammering hololyzer
+        if batch_start + MAX_WORKERS < len(new_videos):
+            time.sleep(BATCH_DELAY)
 
 
 def load_existing_ids(output_file):
@@ -317,7 +389,7 @@ def process_output_file(output_file, fieldnames, limit_recent_only=False):
         try:
             params = {"type": "stream", "paginated": "true"}
             headers = {"X-APIKEY": HOLODEX_API_KEY}
-            resp = requests.get(f"{holodex_api_url}/channels/{ch['id']}/videos", params=params, headers=headers)
+            resp = session.get(f"{holodex_api_url}/channels/{ch['id']}/videos", params=params, headers=headers)
             resp.raise_for_status()
             resp.encoding = 'utf-8'
             data = resp.json()
