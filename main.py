@@ -61,6 +61,40 @@ response_string_ja.raise_for_status()
 response_string_ja.encoding = "utf-8"
 string_ja = response_string_ja.json()
 
+# --- Holodex API helper with rate-limit backoff ---
+# Backoff schedule: 15, 30, 45, 60, 75, 150 seconds. Exits on final failure.
+HOLODEX_BACKOFFS = [15, 30, 45, 60, 75, 150]
+
+def holodex_get(url, params=None):
+    """GET holodex API with exponential-ish backoff on 429. Exits on final failure."""
+    headers = {"X-APIKEY": HOLODEX_API_KEY}
+    max_attempts = len(HOLODEX_BACKOFFS) + 1  # 1 immediate + retries
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = session.get(url, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            return resp
+        except requests.exceptions.HTTPError as error:
+            status = error.response.status_code if error.response else None
+            if status == 429 and attempt < max_attempts:
+                wait = HOLODEX_BACKOFFS[attempt - 1]
+                print(f"  [holodex 429] Rate limited. Waiting {wait}s... (attempt {attempt}/{max_attempts - 1})")
+                time.sleep(wait)
+            elif status == 429:
+                print(f"  [holodex FATAL] 429 after {max_attempts} attempts. Exiting.")
+                sys.exit(1)
+            else:
+                raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+            if attempt < max_attempts:
+                wait = HOLODEX_BACKOFFS[attempt - 1]
+                print(f"  [holodex retry] {type(error).__name__}, waiting {wait}s... (attempt {attempt}/{max_attempts - 1})")
+                time.sleep(wait)
+            else:
+                print(f"  [holodex FATAL] {type(error).__name__} after {max_attempts} attempts. Exiting.")
+                sys.exit(1)
+
 def channels():
     response = session.get(hololyzer_url)
     response.raise_for_status()
@@ -190,42 +224,42 @@ def get_video_data(holodex_info):
         else:
             return ''
 
-    for line in lines:
-        if line.startswith('公開日時'): data['public_time'] = extract_field('date', line)
-        if line.startswith('開始日時'): data['start_time'] = extract_field('date', line)
-        if line.startswith('終了日時'): data['end_time'] = extract_field('date', line)
+        for line in lines:
+            if line.startswith('公開日時'): data['public_time'] = extract_field('date', line)
+            if line.startswith('開始日時'): data['start_time'] = extract_field('date', line)
+            if line.startswith('終了日時'): data['end_time'] = extract_field('date', line)
 
-        if line.startswith('動画時間'): data['total_time'] = extract_field('string', line)
+            if line.startswith('動画時間'): data['total_time'] = extract_field('string', line)
 
-        if line.startswith('総チャット数'): data['chat_num_total'] = extract_field('int', line)
-        if line.startswith('チャット数（日本語）'): data['chat_num_ja'] = extract_field('int', line)
-        if line.startswith('チャット数（スタンプ）'): data['chat_num_emoji'] = extract_field('int', line)
-        if line.startswith('チャット数（英語）'): data['chat_num_en'] = extract_field('int', line)
+            if line.startswith('総チャット数'): data['chat_num_total'] = extract_field('int', line)
+            if line.startswith('チャット数（日本語）'): data['chat_num_ja'] = extract_field('int', line)
+            if line.startswith('チャット数（スタンプ）'): data['chat_num_emoji'] = extract_field('int', line)
+            if line.startswith('チャット数（英語）'): data['chat_num_en'] = extract_field('int', line)
 
-        if line.startswith('ユニークユーザー数'): data['uniq_user_num'] = extract_field('int', line)
-        if line.startswith('ユニークメンバー数'): data['uniq_member_num'] = extract_field('int', line)
+            if line.startswith('ユニークユーザー数'): data['uniq_user_num'] = extract_field('int', line)
+            if line.startswith('ユニークメンバー数'): data['uniq_member_num'] = extract_field('int', line)
 
-        if line.startswith('総スパチャ金額'): data['total_super_chat_amount_yen'] = extract_field('int', line)
+            if line.startswith('総スパチャ金額'): data['total_super_chat_amount_yen'] = extract_field('int', line)
 
-        if line.startswith('英語コメ率'): data['english_chat_ratio'] = extract_field('percent', line)
-        if line.startswith('メンバーコメ率'): data['member_chat_ratio'] = extract_field('percent', line)
+            if line.startswith('英語コメ率'): data['english_chat_ratio'] = extract_field('percent', line)
+            if line.startswith('メンバーコメ率'): data['member_chat_ratio'] = extract_field('percent', line)
 
-        if line.startswith('平均毎秒コメ数'): data['chat_per_second'] = extract_field('float', line)
+            if line.startswith('平均毎秒コメ数'): data['chat_per_second'] = extract_field('float', line)
 
-        if line.startswith('最大同接'): data['max_ccv'] = extract_field('int', line)
+            if line.startswith('最大同接'): data['max_ccv'] = extract_field('int', line)
 
-        if line.startswith('メンシ入り'): data['member_num'] = extract_field('int', line)
+            if line.startswith('メンシ入り'): data['member_num'] = extract_field('int', line)
 
-        if line.startswith('メンシギフト') and '-' not in line:
-            match = re.search(r"(\d+)\D+(\d+)", line)
+            if line.startswith('メンシギフト') and '-' not in line:
+                match = re.search(r"(\d+)\D+(\d+)", line)
 
-            if match:
-                data['member_gift_num_from'] = int(match.group(1))
-                data['member_gift_num_to'] = int(match.group(2))
+                if match:
+                    data['member_gift_num_from'] = int(match.group(1))
+                    data['member_gift_num_to'] = int(match.group(2))
 
-        if line.startswith('マイルストーン'): data['milestone_num'] = extract_field('int', line)
+            if line.startswith('マイルストーン'): data['milestone_num'] = extract_field('int', line)
 
-    return data
+        return data
 
 
 def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
@@ -246,10 +280,7 @@ def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
 
     if last_n is not None:
         params = {"type": "stream", "limit": last_n, "offset": 0}
-        headers = { "X-APIKEY": HOLODEX_API_KEY }
-        response = session.get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params, headers=headers)
-        response.raise_for_status()
-        response.encoding = "utf-8"
+        response = holodex_get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params)
         holodex_video_info_response = response.json()
         for holodex_video in holodex_video_info_response:
             videos_result.append({
@@ -268,11 +299,7 @@ def videos_with_data(channel, csv_writer, fieldnames, existing_ids=None):
                 "offset": len(videos_result),
             }
 
-            headers = { "X-APIKEY": HOLODEX_API_KEY }
-
-            response = session.get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params, headers=headers)
-            response.raise_for_status()
-            response.encoding = "utf-8"
+            response = holodex_get(f"{holodex_api_url}/channels/{channel['id']}/videos", params=params)
 
             holodex_video_info_response = response.json()
 
@@ -388,10 +415,7 @@ def process_output_file(output_file, fieldnames, limit_recent_only=False):
     def holodex_total_for_channel(ch):
         try:
             params = {"type": "stream", "paginated": "true"}
-            headers = {"X-APIKEY": HOLODEX_API_KEY}
-            resp = session.get(f"{holodex_api_url}/channels/{ch['id']}/videos", params=params, headers=headers)
-            resp.raise_for_status()
-            resp.encoding = 'utf-8'
+            resp = holodex_get(f"{holodex_api_url}/channels/{ch['id']}/videos", params=params)
             data = resp.json()
             # expected top-level 'total' when paginated=true
             if isinstance(data, dict) and 'total' in data:
